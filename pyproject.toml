@@ -19,18 +19,18 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["harness"]
+packages = ["harness", "workflows"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
-# All tests live under tests/ (mirroring the source tree). Keeping testpaths
-# pinned there stops pytest from collecting the test_*-named SOURCE modules
+# Tests live under tests/ and workflows/tests/. Keeping testpaths
+# explicit stops pytest from collecting the test_*-named SOURCE modules
 # inside harness/ (test_masking.py, test_id_normalizer.py, test_executor.py,
 # test_detector.py — implementation code for handling repo tests).
-testpaths = ["tests"]
+testpaths = ["tests", "workflows/tests"]
 
 [tool.ruff]
 line-length = 120

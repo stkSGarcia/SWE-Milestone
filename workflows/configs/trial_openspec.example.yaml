@@ -1,0 +1,10 @@
+data_root: ${SWE_MILESTONE_DATA_ROOT}
+trial_name: codex_openspec
+agent: codex
+model: gpt-5.5
+timeout: 18000
+reasoning_effort: high
+workflow_config: openspec.yaml
+repos:
+- navidrome
+- scikit-learn

@@ -798,8 +798,14 @@ try:
     os.chown(gitconfig_path, uid, gid)
     os.chmod(gitconfig_path, 0o644)
 
+    # Own the parent as well so tools can create sibling config directories.
+    config_dir = '/home/fakeroot/.config'
+    os.makedirs(config_dir, exist_ok=True)
+    os.chown(config_dir, uid, gid)
+    os.chmod(config_dir, 0o755)
+
     # Create .config/git directory
-    git_config_dir = '/home/fakeroot/.config/git'
+    git_config_dir = os.path.join(config_dir, 'git')
     os.makedirs(git_config_dir, exist_ok=True)
     os.chown(git_config_dir, uid, gid)
     os.chmod(git_config_dir, 0o755)
@@ -904,6 +910,10 @@ print("Container initialization complete!")
 
         # Add agent environment variables (API keys, etc.)
         docker_options.extend(self.get_agent_env_vars())
+
+        extension = getattr(self, "runtime_extension", None)
+        if extension:
+            docker_options.extend(extension.mounts())
 
         # Add e2e_workspace mount if specified
         if self.e2e_workspace_path:
@@ -1316,9 +1326,31 @@ test ! -w __GO_SHELL_ENV__
             )
         logger.info("Sealed Go runtime verified: go%s, immutable local proxy", actual)
 
+    def _repair_user_config_access(self) -> None:
+        """Make the config parent writable, including in retained pre-fix containers."""
+        script = '''
+import os
+import pwd
+
+user = pwd.getpwnam('fakeroot')
+path = '/home/fakeroot/.config'
+os.makedirs(path, exist_ok=True)
+os.chown(path, user.pw_uid, user.pw_gid)
+os.chmod(path, 0o755)
+'''
+        result = subprocess.run(
+            ["docker", "exec", "--user", "root", self.container_name, "python3", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Cannot prepare fakeroot config directory: {result.stderr or result.stdout}")
+
     def verify_runtime_environment(self) -> None:
-        """Shared fresh/resume gate for all quarantine runtime prerequisites."""
+        """Shared fresh/resume gate for user access and quarantine prerequisites."""
         self._verify_bound_runtime_policy_env()
+        self._repair_user_config_access()
         self._repair_existing_quarantine_cache_access()
         self._harden_go_offline_runtime()
         self._prepare_go_disposable_dirs(reset_module_cache=False)
@@ -2106,6 +2138,10 @@ echo "Go env vars configured (GOPROXY={_goproxy})"
         # sidecar-IP ACCEPT to the just-applied lockdown. Same code path is used
         # on resume, so it must run after the base lockdown is in place.
         self._ensure_sni_sidecar()
+
+        extension = getattr(self, "runtime_extension", None)
+        if extension:
+            extension.allow_services()
 
         # --- Step 7: Verify lockdown ---
         self.verify_network_lockdown()

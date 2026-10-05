@@ -623,3 +623,63 @@ def test_trial_end_watcher_death_beats_done_dag(tmp_path):
 
     assert ok is False, "a done DAG must not override a dead watcher"
     assert runner._last_run_summary["stop_reason"] == "watcher_dead"
+
+
+@pytest.mark.parametrize("advancing", [True, False])
+def test_recovery_counts_workflow_stages_and_still_stops_stalled_workflows(tmp_path, advancing):
+    from types import SimpleNamespace
+    from harness.e2e.config import E2EConfig
+
+    runner = _make_runner(tmp_path)
+    orch = runner.orchestrator
+    orch.config = E2EConfig()
+    orch.config.config["retry_and_timing"].update(max_no_progress_attempts=1, recovery_wait_seconds=0)
+    dag = orch.dag
+    dag.get_state_snapshot.side_effect = lambda: {
+        "completed": set(dag.completed_milestones), "submitted": set(), "failed": set()
+    }
+    dag.is_done.side_effect = lambda: bool(dag.completed_milestones)
+    stages, calls = set(), []
+
+    def advance(*args, **kwargs):
+        calls.append(True)
+        if advancing:
+            stages.add(("stage", "M001", str(len(calls))))
+            if len(calls) == 4:
+                dag.completed_milestones.add("M001")
+        return True
+
+    agent = MagicMock()
+    agent.run.side_effect = advance
+    agent.send_recover_message.side_effect = advance
+    agent._last_fatal_error = None
+    runner.workflow = SimpleNamespace(
+        create_runner=lambda **kwargs: agent,
+        progress_snapshot=lambda: set(stages),
+    )
+    runner._wait_for_evaluations = lambda: "all_done" if dag.is_done() else "new_tasks"
+
+    assert runner.run_agent_with_recovery() is advancing
+    assert len(calls) == (4 if advancing else 1)
+    assert runner._last_run_summary["stop_reason"] == ("all_done" if advancing else "no_progress_limit")
+
+
+def test_waits_for_workflow_submission_before_watcher_discovery(tmp_path):
+    from types import SimpleNamespace
+
+    runner = _make_runner(tmp_path)
+    dag = runner.orchestrator.dag
+    dag.get_next_runnable.return_value = ["M001"]
+    runner.workflow = SimpleNamespace(pending_submissions=lambda: {"M001"})
+    runner._drain_pending_events = lambda: None
+    runner.eval_event_queue.put(("eval_complete", "M001"))
+    consumed = []
+
+    def complete(event):
+        consumed.append(event)
+        dag.is_done.return_value = True
+        return "all_done"
+
+    runner._process_queue_event = complete
+    assert runner._wait_for_evaluations(max_wait=1) == "all_done"
+    assert consumed == [("eval_complete", "M001")]

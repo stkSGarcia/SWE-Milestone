@@ -1,0 +1,20 @@
+schema_version: 1
+provider: openspec
+runtime_image: swe-workflow-openspec:1.7.0
+versions:
+  openspec: 1.7.0
+stages:
+  - name: openspec-propose
+    arguments:
+      - 'Please make the changes for the following task. Do not implement code for this stage.'
+      - '{task}'
+  - name: openspec-apply-change
+    arguments: ['{change_id}']
+  - name: openspec-sync-specs
+    arguments: ['{change_id}']
+  - name: openspec-archive-change
+    arguments: ['{change_id}']
+budgets:
+  stage_seconds: 7200
+  milestone_seconds: 28800
+  max_attempts: 2
