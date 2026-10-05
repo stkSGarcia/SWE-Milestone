@@ -72,6 +72,27 @@ def test_container_setup_rejects_mismatched_exact_version(monkeypatch):
         setup.get_agent_version(verify_requested=True)
 
 
+@pytest.mark.parametrize("agent_version", [None, "latest", "0.163.0"])
+def test_container_setup_rejects_missing_codex_before_agent_start(monkeypatch, agent_version):
+    setup = ContainerSetup(
+        container_name="trial-container",
+        image_name="invalid-image-ref",
+        agent_framework_name="codex",
+        agent_version=agent_version,
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=127, stdout="", stderr="codex: not found"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not detect codex version.*Repair the agent CLI"):
+        setup.get_agent_version(verify_requested=True)
+    assert setup.get_agent_version() is None
+
+
 def test_orchestrator_records_actual_agent_version(tmp_path):
     metadata_path = tmp_path / "trial_metadata.json"
     metadata_path.write_text(

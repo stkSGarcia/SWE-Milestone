@@ -405,6 +405,48 @@ class TestOfflineCacheAccess:
             self._setup()._verify_maven_offline_smoke()
 
 
+class TestFreshContainerInitialization:
+    @pytest.mark.parametrize("returncode", [0, 1])
+    def test_failed_initialization_stops_before_runtime_setup(self, monkeypatch, returncode):
+        setup = object.__new__(ContainerSetup)
+        setup.container_name = "trial-container"
+        setup.image_name = "fixture-image"
+        setup.workdir = "/testbed"
+        setup.e2e_workspace_path = None
+        setup.container_exists = lambda: False
+        setup.get_agent_mounts = lambda: []
+        setup.get_agent_env_vars = lambda: []
+        events = []
+        setup._ensure_python3 = lambda: events.append("python3")
+        setup.get_init_script = lambda: "raise RuntimeError('Codex install failed')"
+        setup._wait_for_fakeroot = lambda: events.append("fakeroot")
+        setup.verify_runtime_environment = lambda: events.append("runtime-gate")
+        monkeypatch.setattr(
+            "harness.e2e.container_setup.inspect_docker_image_id",
+            lambda *_args, **_kwargs: "a" * 64,
+        )
+
+        def run(command, **kwargs):
+            if command[:2] == ["docker", "run"]:
+                return SimpleNamespace(returncode=0)
+            assert command[:4] == ["docker", "exec", "trial-container", "python3"]
+            events.append("init")
+            return SimpleNamespace(
+                returncode=returncode,
+                stdout="Base container initialization complete!\n",
+                stderr="Codex install failed" if returncode else "",
+            )
+
+        monkeypatch.setattr("harness.e2e.container_setup.subprocess.run", run)
+        if returncode:
+            with pytest.raises(RuntimeError, match="Container initialization failed.*exit code 1"):
+                setup.start_container()
+            assert events == ["python3", "init"]
+        else:
+            setup.start_container()
+            assert events == ["python3", "init", "fakeroot", "runtime-gate"]
+
+
 class TestExistingContainerCacheRepair:
     """Resume paths must not bypass the cache repair and verification gate."""
 

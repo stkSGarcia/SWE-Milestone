@@ -3334,9 +3334,33 @@ class PatchEvaluator:
                     f"{pattern}:\n{audit.stdout.strip()}"
                 )
 
+    def _configure_cpu_limit(self) -> None:
+        """Respect the Docker daemon's capacity, including remote daemons."""
+        result = subprocess.run(
+            ["docker", "info", "--format", "{{.NCPU}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        try:
+            available = int(result.stdout.strip())
+        except ValueError:
+            available = 0
+        if result.returncode != 0 or available < 1:
+            detail = result.stderr.strip() or result.stdout.strip() or "missing CPU count"
+            raise RuntimeError(f"Cannot determine Docker CPU capacity: {detail}")
+        requested = self.docker_cpus
+        self.docker_cpus = min(requested, available)
+        self._eval_meta.update(
+            docker_cpus_requested=requested, docker_cpus_available=available, docker_cpus=self.docker_cpus
+        )
+        if self.docker_cpus != requested:
+            print(f"📋 Docker CPUs capped: {requested} requested, {self.docker_cpus} available")
+
     def start_container(self) -> None:
         """Start Docker container (image already at baseline commit)."""
 
+        self._configure_cpu_limit()
         snapshot_agent_image_id = ""
         if self._go_module_closure_requested() and self.patch_file.suffix == ".tar":
             metadata, _ = self._load_and_validate_snapshot_metadata()
@@ -3450,7 +3474,11 @@ class PatchEvaluator:
             "/dev/null",
         ]
 
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(f"Cannot start evaluation container (exit {exc.returncode}): {detail}") from exc
         try:
             self._install_jest_ipc_guard()
             self._verify_evaluator_go_toolchain()

@@ -2,14 +2,15 @@
 
 import json
 import logging
+import re
 import subprocess
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from harness.e2e.log_parser.base import AgentLogParser, register_parser
 from harness.e2e.log_parser.models import NativeUsageUnit, ToolCallRecord
+from harness.e2e.pricing import calculate_cost, has_tiered_pricing
 from harness.e2e.pricing import resolve_pricing as _resolve_pricing_shared
 
 logger = logging.getLogger(__name__)
@@ -346,14 +347,15 @@ class CodexLogParser(AgentLogParser):
         """Resolve flat or tiered pricing for a model.
 
         For tiered models, the threshold is evaluated against the per-request
-        input token count.  When *context_window* is provided it is used as
-        the upper-bound for per-request size (a single request can never
-        exceed the context window).  This prevents session-level aggregates
+        input token count, including cached tokens.
+        ``context_window`` remains accepted for compatibility, but model
+        capacity does not determine the request's pricing tier.
+        This prevents session-level aggregates
         (which can be millions of tokens) from incorrectly triggering the
-        higher pricing tier.
+        higher pricing tier. Aggregates without request receipts are handled
+        separately as estimates.
         """
-        tier_key = context_window if context_window is not None else input_tokens
-        rates = _resolve_pricing_shared(model, prompt_tokens=tier_key)
+        rates = _resolve_pricing_shared(model, prompt_tokens=input_tokens)
         # Map canonical field name to Codex-expected field name
         return {
             "input": rates.get("input", 0),
@@ -369,13 +371,14 @@ class CodexLogParser(AgentLogParser):
         cached_tokens: int = 0,
         reasoning_tokens: int = 0,
         context_window: Optional[int] = None,
+        cache_write_tokens: int = 0,
     ) -> float:
         """Calculate cost based on token usage.
 
         Cost formula:
-            cost = input_cost + cached_cost + output_cost
+            cost = input_cost + cached_cost + output_cost + cache_write_cost
         Where:
-            - input_cost = (input_tokens - cached_tokens) / 1M × input_price
+            - input_cost = (input_tokens - cached_tokens - cache_write_tokens) / 1M × input_price
             - cached_cost = cached_tokens / 1M × cached_input_price
             - output_cost = (output_tokens + reasoning_tokens) / 1M × output_price
 
@@ -390,145 +393,174 @@ class CodexLogParser(AgentLogParser):
             cached_tokens: Cached input tokens (subset of input_tokens)
             reasoning_tokens: Additional reasoning/thought tokens (default 0,
                 only use if output_tokens does NOT include reasoning)
-            context_window: Model context window size. Used for tiered pricing
-                to determine the correct tier (per-request size cannot exceed
-                context window).
+            context_window: Accepted for compatibility; ignored for pricing.
+            cache_write_tokens: Cache writes included in total input tokens.
 
         Returns:
             Estimated cost in USD
         """
-        pricing = self._resolve_pricing(model, input_tokens, context_window=context_window)
+        return calculate_cost(
+            model=model,
+            # Non-cached input tokens
+            input_tokens=max(0, input_tokens - cached_tokens - cache_write_tokens),
+            # Output tokens (including reasoning tokens)
+            output_tokens=output_tokens + reasoning_tokens,
+            # Cached input tokens (discounted rate)
+            cache_read_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+            prompt_tokens=input_tokens,
+        )
 
-        # Non-cached input tokens
-        non_cached_input = max(0, input_tokens - cached_tokens)
-        input_cost = (non_cached_input / 1_000_000) * pricing["input"]
-
-        # Cached input tokens (discounted rate)
-        cached_cost = (cached_tokens / 1_000_000) * pricing["cached_input"]
-
-        # Output tokens (including reasoning tokens)
-        total_output = output_tokens + reasoning_tokens
-        output_cost = (total_output / 1_000_000) * pricing["output"]
-
-        return input_cost + cached_cost + output_cost
+    def _read_rollout_usage(self, log_dir: Path) -> dict:
+        """Read request receipts, deduplicated across copies of each thread."""
+        threads = {}
+        seen_totals = set()
+        for jsonl_file in sorted(log_dir.glob("*.jsonl")):
+            match = re.search(r"([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$", jsonl_file.stem)
+            thread_id = match.group(1) if match else jsonl_file.stem.removeprefix("rollout-")
+            try:
+                with jsonl_file.open(encoding="utf-8") as stream:
+                    for line_num, line in enumerate(stream, 1):
+                        try:
+                            event = json.loads(line)
+                        except ValueError:
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        payload = event.get("payload", {})
+                        if not isinstance(payload, dict):
+                            continue
+                        if event.get("type") == "session_meta" and isinstance(payload.get("id"), str):
+                            thread_id = payload["id"]
+                        record = threads.setdefault(
+                            thread_id,
+                            {
+                                "model": "unknown",
+                                "context_window": None,
+                                "turns": 0,
+                                "units": [],
+                            },
+                        )
+                        if event.get("type") in {"session_meta", "turn_context"}:
+                            model = payload.get("model")
+                            if isinstance(model, str) and model:
+                                record["model"] = model
+                            if event["type"] == "turn_context":
+                                # Count turn_context events as LLM API calls (turns)
+                                # when native request receipts are unavailable.
+                                record["turns"] += 1
+                            continue
+                        # Extract detailed token info from event_msg
+                        if event.get("type") != "event_msg" or payload.get("type") != "token_count":
+                            continue
+                        info = payload.get("info")
+                        if not isinstance(info, dict):
+                            continue
+                        # Get context window (metadata only; it does not select a price tier).
+                        context_window = info.get("model_context_window")
+                        if type(context_window) is int and context_window > 0:
+                            record["context_window"] = context_window
+                        last = info.get("last_token_usage")
+                        if not isinstance(last, dict):
+                            continue
+                        fields = (
+                            "input_tokens",
+                            "cached_input_tokens",
+                            "cache_write_input_tokens",
+                            "output_tokens",
+                            "reasoning_output_tokens",
+                        )
+                        try:
+                            counts = tuple(max(0, int(last.get(key, 0) or 0)) for key in fields)
+                            # Get total usage from last token_count event
+                            cumulative = info.get("total_token_usage")
+                            # Codex may emit duplicate token_count snapshots; dedupe by
+                            # cumulative totals within each thread, including copied rollout files.
+                            if isinstance(cumulative, dict) and cumulative:
+                                key = (thread_id, tuple(int(cumulative.get(field, 0) or 0) for field in fields))
+                            else:
+                                key = (jsonl_file.name, line_num)
+                        except (TypeError, ValueError):
+                            continue
+                        if not any(counts) or key in seen_totals:
+                            continue
+                        seen_totals.add(key)
+                        input_tokens, cached_tokens, cache_write_tokens, output_tokens, reasoning_tokens = counts
+                        timestamp = None
+                        ts = event.get("timestamp")
+                        if isinstance(ts, str):
+                            try:
+                                timestamp = datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+                            except ValueError:
+                                pass
+                        # Note: output_tokens already includes reasoning tokens.
+                        # reasoning_output_tokens is a detail, not additional output.
+                        record["units"].append(
+                            NativeUsageUnit(
+                                id=f"{jsonl_file.name}:{line_num}",
+                                source_type="turn",
+                                timestamp=timestamp,
+                                model=record["model"],
+                                token_usage={
+                                    "inputTokens": input_tokens,
+                                    "outputTokens": output_tokens,
+                                    "cacheReadInputTokens": cached_tokens,
+                                    "cacheCreationInputTokens": cache_write_tokens,
+                                    "reasoningOutputTokens": reasoning_tokens,
+                                },
+                                cost_usd=self._calculate_cost(
+                                    record["model"],
+                                    input_tokens,
+                                    output_tokens,
+                                    cached_tokens=cached_tokens,
+                                    cache_write_tokens=cache_write_tokens,
+                                ),
+                            )
+                        )
+            except (OSError, UnicodeError) as error:
+                logger.warning("Could not read Codex usage from %s: %s", jsonl_file, error)
+        return threads
 
     def parse_native_usage_units(
         self,
         log_dir: Path,
         stdout_file: Path,
     ) -> List[NativeUsageUnit]:
-        """Parse native turn-level usage units from Codex token_count events."""
-        units: List[NativeUsageUnit] = []
-        jsonl_files = sorted(log_dir.glob("*.jsonl"))
-        if not jsonl_files:
-            return units
+        """Parse native turn-level usage units from Codex token_count events.
 
-        context_window: Optional[int] = None
+        Price each native request using its own input length.
+        """
+        return [unit for record in self._read_rollout_usage(log_dir).values() for unit in record["units"]]
 
-        for jsonl_file in jsonl_files:
-            current_model = "unknown"
-            seen_total_usage_keys = set()
+    @staticmethod
+    def _accumulate_usage(model_usage: dict, model: str, usage: dict, cost: float, source: str) -> None:
+        entry = model_usage.setdefault(model, {})
+        for field in (
+            "inputTokens",
+            "outputTokens",
+            "cachedInputTokens",
+            "cacheCreationInputTokens",
+            "reasoningOutputTokens",
+        ):
+            entry[field] = entry.get(field, 0) + usage.get(field, 0)
+        entry["costUSD"] = entry.get("costUSD", 0.0) + cost
+        previous = entry.get("costSource", source)
+        entry["costSource"] = source if previous == source else "mixed"
+        entry["tokenAccounting"] = "openai"
 
-            try:
-                with open(jsonl_file, encoding="utf-8") as f:
-                    for line_num, line in enumerate(f, 1):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        event_type = event.get("type", "")
-                        if event_type == "turn_context":
-                            payload = event.get("payload", {})
-                            if isinstance(payload, dict):
-                                model = payload.get("model")
-                                if isinstance(model, str) and model:
-                                    current_model = model
-                            continue
-
-                        if event_type != "event_msg":
-                            continue
-                        payload = event.get("payload", {})
-                        if not isinstance(payload, dict) or payload.get("type") != "token_count":
-                            continue
-
-                        info = payload.get("info", {})
-                        if not isinstance(info, dict):
-                            continue
-                        if context_window is None:
-                            cw = info.get("model_context_window")
-                            if isinstance(cw, int) and cw > 0:
-                                context_window = cw
-
-                        last_usage = info.get("last_token_usage", {})
-                        total_usage = info.get("total_token_usage", {})
-                        if not isinstance(last_usage, dict) or not isinstance(total_usage, dict):
-                            continue
-
-                        total_key = (
-                            int(total_usage.get("input_tokens", 0) or 0),
-                            int(total_usage.get("cached_input_tokens", 0) or 0),
-                            int(total_usage.get("output_tokens", 0) or 0),
-                            int(total_usage.get("reasoning_output_tokens", 0) or 0),
-                        )
-                        # Codex may emit duplicate token_count snapshots; dedupe by
-                        # cumulative totals within each rollout file.
-                        if total_key in seen_total_usage_keys:
-                            continue
-                        seen_total_usage_keys.add(total_key)
-
-                        input_tokens = int(last_usage.get("input_tokens", 0) or 0)
-                        cached_tokens = int(last_usage.get("cached_input_tokens", 0) or 0)
-                        output_tokens = int(last_usage.get("output_tokens", 0) or 0)
-                        reasoning_tokens = int(last_usage.get("reasoning_output_tokens", 0) or 0)
-                        if input_tokens <= 0 and cached_tokens <= 0 and output_tokens <= 0 and reasoning_tokens <= 0:
-                            continue
-
-                        timestamp = None
-                        ts_str = event.get("timestamp")
-                        if isinstance(ts_str, str) and ts_str:
-                            try:
-                                timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).replace(tzinfo=None)
-                            except ValueError:
-                                timestamp = None
-
-                        cost = self._calculate_cost(
-                            current_model,
-                            input_tokens=input_tokens,
-                            output_tokens=output_tokens,
-                            cached_tokens=cached_tokens,
-                            reasoning_tokens=reasoning_tokens,
-                            context_window=context_window,
-                        )
-                        units.append(
-                            NativeUsageUnit(
-                                id=f"{jsonl_file.name}:{line_num}",
-                                source_type="turn",
-                                timestamp=timestamp,
-                                model=current_model,
-                                token_usage={
-                                    "inputTokens": input_tokens,
-                                    "outputTokens": output_tokens + reasoning_tokens,
-                                    "cacheReadInputTokens": cached_tokens,
-                                    "reasoningOutputTokens": reasoning_tokens,
-                                },
-                                cost_usd=cost,
-                            )
-                        )
-            except Exception as e:
-                logger.debug(f"Error parsing native usage units from {jsonl_file}: {e}")
-
-        logger.info(f"Parsed {len(units)} native usage units from Codex logs")
-        return units
-
-    def parse_stdout_stats(self, stdout_file: Path, logs_dir: Optional[Path] = None) -> Dict:
+    def parse_stdout_stats(
+        self,
+        stdout_file: Path,
+        logs_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
         """Parse agent_stdout.txt and JSONL files for accumulated statistics.
 
         Codex JSON output includes usage information in turn.completed events.
         JSONL files contain more detailed token_count events with context window info.
+
+        Sum native request costs; mark stdout-only totals as estimates.
+        turn.completed contains cumulative thread usage, not request lengths;
+        use it only to recover usage not covered by native token_count receipts.
 
         Args:
             stdout_file: Path to agent_stdout.txt
@@ -537,182 +569,140 @@ class CodexLogParser(AgentLogParser):
         Returns:
             Dictionary with accumulated statistics
         """
-        total_cost = 0.0
-        total_turns = 0
-        model_usage: Dict[str, Dict[str, Any]] = defaultdict(lambda: defaultdict(int))
-        session_count = 0
-        unique_session_ids: set[str] = set()
-        current_model = "unknown"
-        context_window = None
-        reasoning_tokens = 0
-        # Track previous cumulative usage from turn.completed events.
-        # Codex turn.completed reports thread-level cumulative totals that
-        # increase monotonically across resume sessions.  We need deltas.
-        prev_cumulative: Dict[str, int] = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cached_tokens": 0,
-        }
-
-        if not stdout_file.exists():
-            logger.warning(f"stdout file not found: {stdout_file}")
-            return {
-                "total_cost_usd": 0.0,
-                "total_turns": 0,
-                "modelUsage": {},
-                "session_count": 0,
-                "unique_session_count": 0,
-            }
-
         # Determine log directory: prefer logs_dir if provided, otherwise use stdout_file.parent/codex
         # Note: logs_dir from extract_raw_logs already points to the codex/ subdirectory
-        log_dir = logs_dir if logs_dir else stdout_file.parent / "codex"
-        if log_dir.exists():
-            for jsonl_file in sorted(log_dir.glob("*.jsonl")):
-                try:
-                    with open(jsonl_file, encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                event = json.loads(line)
-                                event_type = event.get("type", "")
-
-                                # Count turn_context events as LLM API calls (turns)
-                                # Each turn_context represents one LLM inference call
-                                if event_type == "turn_context":
-                                    total_turns += 1
-                                    model = event.get("payload", {}).get("model")
-                                    if model:
-                                        current_model = model
-
-                                # Extract detailed token info from event_msg
-                                elif event_type == "event_msg":
-                                    payload = event.get("payload", {})
-                                    if payload.get("type") == "token_count":
-                                        info = payload.get("info")
-                                        if info:
-                                            # Get context window (same for all events)
-                                            if context_window is None:
-                                                context_window = info.get("model_context_window")
-
-                                            # Get total usage from last token_count event
-                                            total_usage = info.get("total_token_usage", {})
-                                            if total_usage:
-                                                reasoning_tokens = total_usage.get("reasoning_output_tokens", 0)
-
-                            except json.JSONDecodeError:
-                                continue
-                except Exception as e:
-                    logger.debug(f"Error parsing JSONL {jsonl_file}: {e}")
-
+        log_dir = logs_dir if logs_dir is not None else stdout_file.parent / "codex"
+        rollouts = self._read_rollout_usage(log_dir)
+        # Track previous cumulative usage from turn.completed events.
+        # Codex turn.completed reports thread-level cumulative totals that
+        # increase monotonically across resume sessions. Keep the latest totals
+        # per thread so earlier usage is not counted again after a resume.
+        receipts = {}
+        session_count = 0
+        thread_ids = set()
+        current_thread = "unidentified"
         # Parse stdout for session counts and final usage
-        with open(stdout_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                event_type = data.get("type", "")
-
-                # Count sessions from thread.started
-                if event_type == "thread.started":
-                    session_count += 1
-                    thread_id = data.get("thread_id")
-                    if not thread_id and isinstance(data.get("thread"), dict):
-                        thread_id = data["thread"].get("id")
-                    if not thread_id:
-                        thread_id = data.get("session_id")
-                    if isinstance(thread_id, str) and thread_id:
-                        unique_session_ids.add(thread_id)
-
-                # Extract usage from turn.completed events
-                # Note: total_turns is counted from turn_context events in JSONL files
-                #
-                # IMPORTANT: turn.completed reports thread-level CUMULATIVE token
-                # totals.  When a trial resumes (same thread_id), each session's
-                # turn.completed carries the running total so far.  We must
-                # compute the delta vs the previous turn.completed to get the
-                # per-session increment.
-                if event_type == "turn.completed":
-                    usage = data.get("usage", {})
-
-                    if usage:
+        if stdout_file.exists():
+            with stdout_file.open(encoding="utf-8") as stream:
+                for line in stream:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    # Count sessions from thread.started
+                    if event.get("type") == "thread.started":
+                        session_count += 1
+                        nested = event.get("thread")
+                        current_thread = str(
+                            event.get("thread_id")
+                            or (nested.get("id") if isinstance(nested, dict) else None)
+                            or event.get("session_id")
+                            or "unidentified"
+                        )
+                        thread_ids.add(current_thread)
+                    # Extract usage from turn.completed events
+                    # Note: total_turns is counted from native request receipts,
+                    # falling back to turn_context events in JSONL files.
+                    #
+                    # IMPORTANT: turn.completed reports thread-level CUMULATIVE token
+                    # totals. When a trial resumes (same thread_id), each session's
+                    # turn.completed carries the running total so far. Keep the latest
+                    # snapshot per thread, then subtract already counted request usage.
+                    if event.get("type") != "turn.completed":
+                        continue
+                    usage = event.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+                    try:
                         # Codex uses input_tokens/output_tokens (not prompt_tokens/completion_tokens)
-                        cum_input = usage.get("input_tokens", usage.get("prompt_tokens", 0))
-                        cum_output = usage.get("output_tokens", usage.get("completion_tokens", 0))
-                        cum_cached = usage.get("cached_input_tokens", 0)
-
-                        # Compute per-session delta
-                        delta_input = cum_input - prev_cumulative["input_tokens"]
-                        delta_output = cum_output - prev_cumulative["output_tokens"]
-                        delta_cached = cum_cached - prev_cumulative["cached_tokens"]
-
                         # Update cumulative tracker
-                        prev_cumulative["input_tokens"] = cum_input
-                        prev_cumulative["output_tokens"] = cum_output
-                        prev_cumulative["cached_tokens"] = cum_cached
-
-                        model_usage[current_model]["inputTokens"] += delta_input
-                        model_usage[current_model]["outputTokens"] += delta_output
-                        model_usage[current_model]["cachedInputTokens"] += delta_cached
-
-                        # Calculate cost per model using delta (with cached tokens)
-                        # Note: output_tokens already includes reasoning tokens.
-                        # Pass context_window so tiered pricing uses per-request
-                        # size (not session-level delta which can be millions).
-                        turn_cost = self._calculate_cost(
-                            current_model,
-                            delta_input,
-                            delta_output,
-                            cached_tokens=delta_cached,
-                            context_window=context_window,
-                        )
-                        model_usage[current_model]["costUSD"] = (
-                            model_usage[current_model].get("costUSD", 0.0) + turn_cost
-                        )
-                        total_cost += turn_cost
-
-        # Add context window and reasoning tokens to model usage.
-        # turn.completed output_tokens does NOT include reasoning tokens,
-        # so we must add the reasoning cost separately.
-        if current_model in model_usage:
+                        # Keep the latest totals per logical thread across resumes.
+                        receipts[current_thread] = {
+                            "inputTokens": max(0, int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)),
+                            "outputTokens": max(
+                                0, int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+                            ),
+                            "cachedInputTokens": max(0, int(usage.get("cached_input_tokens", 0) or 0)),
+                            "cacheCreationInputTokens": max(0, int(usage.get("cache_write_input_tokens", 0) or 0)),
+                            "reasoningOutputTokens": max(0, int(usage.get("reasoning_output_tokens", 0) or 0)),
+                        }
+                    except (TypeError, ValueError):
+                        continue
+        if "unidentified" in receipts and len(rollouts) == 1:
+            receipts[next(iter(rollouts))] = receipts.pop("unidentified")
+        known_models = (
+            {r["model"] for r in rollouts.values()} | {unit.model for r in rollouts.values() for unit in r["units"]}
+        ) - {"unknown"}
+        fallback_model = next(iter(known_models)) if len(known_models) == 1 else "unknown"
+        model_usage = {}
+        total_turns = 0
+        for thread_id in sorted(rollouts.keys() | receipts.keys()):
+            record = rollouts.get(thread_id, {})
+            covered = {}
+            units = record.get("units", [])
+            total_turns += len(units) if units else record.get("turns", 0)
+            for unit in units:
+                usage = dict(unit.token_usage)
+                usage["cachedInputTokens"] = usage.pop("cacheReadInputTokens", 0)
+                self._accumulate_usage(model_usage, unit.model, usage, unit.cost_usd, "request_usage")
+                for field, value in usage.items():
+                    covered[field] = covered.get(field, 0) + value
+            receipt = receipts.get(thread_id, {})
+            # Compute the delta not covered by native request receipts.
+            residual = {field: max(0, count - covered.get(field, 0)) for field, count in receipt.items()}
+            if any(
+                residual.get(field, 0)
+                for field in ("inputTokens", "outputTokens", "cachedInputTokens", "cacheCreationInputTokens")
+            ):
+                model = record.get("model", fallback_model)
+                if model == "unknown":
+                    model = fallback_model
+                # The aggregate cannot reveal how many requests crossed a tier.
+                # Retain the legacy base-rate estimate, explicitly labeled.
+                # Calculate cost per model using delta (with cached tokens)
+                # Note: output_tokens already includes reasoning tokens.
+                cost = calculate_cost(
+                    model=model,
+                    input_tokens=max(
+                        0,
+                        residual["inputTokens"] - residual["cachedInputTokens"] - residual["cacheCreationInputTokens"],
+                    ),
+                    output_tokens=residual["outputTokens"],
+                    cache_read_tokens=residual["cachedInputTokens"],
+                    cache_write_tokens=residual["cacheCreationInputTokens"],
+                )
+                self._accumulate_usage(model_usage, model, residual, cost, "aggregate_estimate")
+                if has_tiered_pricing(model):
+                    logger.warning(
+                        "Codex thread %s lacks request-level usage for some tokens; "
+                        "costSource=aggregate_estimate uses base-tier rates",
+                        thread_id,
+                    )
+            # Add context window to model usage. Reasoning details were accumulated above.
+            context_window = record.get("context_window")
             if context_window:
-                model_usage[current_model]["contextWindow"] = context_window
-            if reasoning_tokens > 0:
-                model_usage[current_model]["reasoningOutputTokens"] = reasoning_tokens
-                pricing = self._resolve_pricing(
-                    current_model, 0, context_window=context_window
-                )
-                reasoning_cost = (reasoning_tokens / 1_000_000) * pricing["output"]
-                model_usage[current_model]["costUSD"] = (
-                    model_usage[current_model].get("costUSD", 0.0) + reasoning_cost
-                )
-                total_cost += reasoning_cost
-
-        # Convert defaultdicts to regular dicts
-        model_usage_dict = {model: dict(usage) for model, usage in model_usage.items()}
-
-        unique_session_count = len(unique_session_ids) if unique_session_ids else session_count
-
-        logger.info(
-            f"Parsed stdout: {session_count} sessions, {unique_session_count} unique sessions, "
-            f"{total_turns} turns, ${total_cost:.4f}"
-        )
-
+                for model in {unit.model for unit in units} | {record.get("model", "unknown")}:
+                    if model in model_usage:
+                        model_usage[model]["contextWindow"] = max(
+                            model_usage[model].get("contextWindow", 0),
+                            context_window,
+                        )
         return {
-            "total_cost_usd": total_cost,
+            "total_cost_usd": sum(usage["costUSD"] for usage in model_usage.values()),
             "total_turns": total_turns,
-            "modelUsage": model_usage_dict,
+            "modelUsage": model_usage,
             "session_count": session_count,
-            "unique_session_count": unique_session_count,
+            "unique_session_count": len(thread_ids) if thread_ids else session_count,
         }
+
+    def _normalize_native_usage_costs(self, native_usage_units: list[NativeUsageUnit], total_cost: float) -> None:
+        """Keep per-request estimates unchanged.
+
+        Any stdout-only residual is an aggregate estimate. Scaling known
+        request costs to absorb that residual would erase their actual tiers.
+        """
 
     def parse_tool_results(
         self,

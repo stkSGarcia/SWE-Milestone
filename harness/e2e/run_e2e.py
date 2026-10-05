@@ -301,6 +301,7 @@ class E2ETrialRunner:
         remove_container: bool = False,
         reasoning_effort: Optional[str] = None,
         force: bool = False,
+        workflow=None,
     ):
         self.orchestrator = orchestrator
         self.agent_output_dir = agent_output_dir
@@ -314,6 +315,7 @@ class E2ETrialRunner:
         self.remove_container = remove_container
         self.reasoning_effort = reasoning_effort
         self.force = force
+        self.workflow = workflow
 
         self.watcher_thread = None
         self.watcher_stop_event = threading.Event()
@@ -1354,8 +1356,11 @@ class E2ETrialRunner:
                 self._drain_pending_events()  # consume the queued event, if any
                 return "watcher_dead"
 
+            workflow_pending = self.workflow.pending_submissions() if getattr(self, "workflow", None) else set()
             with self._state_lock:
-                has_pending = bool(dag.submitted_milestones or self.pending_debounce or self.running_evaluations)
+                has_pending = bool(
+                    dag.submitted_milestones or self.pending_debounce or self.running_evaluations or workflow_pending
+                )
 
             if not has_pending:
                 # Nothing pending - check if there are still runnable tasks
@@ -1380,7 +1385,9 @@ class E2ETrialRunner:
             # Tasks in pending_debounce already have tags submitted, so agent can't make more progress on them
             runnable = dag.get_next_runnable()
             with self._state_lock:
-                runnable_excluding_debounce = [m for m in runnable if m not in self.pending_debounce]
+                runnable_excluding_debounce = [
+                    m for m in runnable if m not in self.pending_debounce and m not in workflow_pending
+                ]
             if runnable_excluding_debounce:
                 logger.info(f"New tasks available: {runnable_excluding_debounce}")
                 return "new_tasks"
@@ -1453,8 +1460,8 @@ class E2ETrialRunner:
         in run() before this method is called, so no sleep is needed.
 
         Progress tracking:
-        - Tracks DAG state (completed + submitted milestones) before and after each run
-        - If progress is made (new milestones completed or submitted), no_progress_count resets
+        - Tracks DAG state and completed workflow stages before and after each run
+        - If progress is made (new milestones or stages), no_progress_count resets
         - If no progress is made, no_progress_count increments
         - Exits after max_no_progress_attempts (3) consecutive attempts without progress
 
@@ -1470,7 +1477,7 @@ class E2ETrialRunner:
         watcher_died = False  # #20: set when the watcher thread dies mid-trial
         max_no_progress_attempts = config.max_no_progress_attempts
 
-        # Track progress by monitoring DAG state changes
+        # Include workflow progress before the watcher accepts submission tags.
         def get_dag_progress_state():
             """Get current DAG progress state for comparison."""
             # Use get_state_snapshot() for atomic read of all state
@@ -1479,6 +1486,7 @@ class E2ETrialRunner:
                 "completed": snapshot["completed"],
                 "submitted": snapshot["submitted"],
                 "failed": snapshot["failed"],
+                "workflow": self.workflow.progress_snapshot() if getattr(self, "workflow", None) else set(),
             }
 
         def has_progress(prev_state, curr_state):
@@ -1487,7 +1495,8 @@ class E2ETrialRunner:
             new_completed = curr_state["completed"] - prev_state["completed"]
             new_submitted = curr_state["submitted"] - prev_state["submitted"]
             new_failed = curr_state["failed"] - prev_state["failed"]
-            return bool(new_completed or new_submitted or new_failed)
+            new_workflow = curr_state["workflow"] - prev_state["workflow"]
+            return bool(new_completed or new_submitted or new_failed or new_workflow)
 
         logger.info("=" * 70)
         logger.info("Starting E2E Agent with Recovery Support")
@@ -1509,7 +1518,8 @@ class E2ETrialRunner:
             }
 
         # Create agent runner
-        self.agent_runner = E2EAgentRunner(
+        runner_factory = self.workflow.create_runner if getattr(self, "workflow", None) else E2EAgentRunner
+        self.agent_runner = runner_factory(
             container_name=self.orchestrator.container_name,
             output_dir=str(self.agent_output_dir),
             workdir=self.workdir,
@@ -1526,7 +1536,10 @@ class E2ETrialRunner:
             # resumed container may predate the immutable Go split. Verify the
             # exact shared runtime and reset only reproducible COW module state
             # before every fresh/resume/recover subprocess.
-            self.orchestrator.container_setup.prepare_agent_invocation()
+            # WorkflowRunner prepares each actual stage invocation itself,
+            # after stopping any invocation left over from an interrupted run.
+            if not getattr(self, "workflow", None):
+                self.orchestrator.container_setup.prepare_agent_invocation()
             return callable_()
 
         # Capture initial state
@@ -1855,7 +1868,8 @@ class E2ETrialRunner:
 
             if made_progress:
                 logger.info(
-                    f"Progress detected: completed={len(curr_state['completed'])}, submitted={len(curr_state['submitted'])}"
+                    f"Progress detected: completed={len(curr_state['completed'])}, "
+                    f"submitted={len(curr_state['submitted'])}, workflow_steps={len(curr_state['workflow'])}"
                 )
                 made_any_progress = True
                 no_progress_count = 0  # Reset no-progress counter
@@ -1998,6 +2012,14 @@ class E2ETrialRunner:
         # Extract agent stats BEFORE removing container
         self._extract_agent_stats()
 
+        workflow_cleanup_error = None
+        if getattr(self, "workflow", None):
+            try:
+                self.workflow.close()
+            except Exception as exc:
+                workflow_cleanup_error = exc
+                logger.error("Workflow cleanup failed: %s", exc)
+
         # Copy testbed from container to trial_root
         if self.copy_testbed:
             testbed_dest = trial_root / "testbed"
@@ -2045,6 +2067,8 @@ class E2ETrialRunner:
         self._release_trial_lock()
 
         logger.info("Cleanup complete.")
+        if workflow_cleanup_error:
+            raise RuntimeError("Workflow artifact/service cleanup failed") from workflow_cleanup_error
 
     def _extract_agent_stats(self):
         """Extract and parse agent logs to compute trial statistics.
@@ -2070,7 +2094,10 @@ class E2ETrialRunner:
 
             # 4. Parse agent_stdout.txt statistics (pass logs_dir for raw log parsing)
             stdout_file = self.agent_output_dir / "agent_stdout.txt"
-            stdout_stats = parser.parse_stdout_stats(stdout_file, logs_dir)
+            if getattr(self, "workflow", None):
+                stdout_stats = self.workflow.parse_stdout_stats(parser, stdout_file, logs_dir)
+            else:
+                stdout_stats = parser.parse_stdout_stats(stdout_file, logs_dir)
 
             # 5. Parse framework-native finest-grained usage units (message/turn)
             native_usage_units = parser.parse_native_usage_units(logs_dir, stdout_file)
@@ -2128,6 +2155,8 @@ class E2ETrialRunner:
             # Setup environment synchronously BEFORE starting agent
             # This ensures container is ready and task queue is populated
             logger.info("Setting up E2E environment (synchronous)...")
+            if getattr(self, "workflow", None):
+                self.workflow.prepare()
             self.orchestrator.setup_environment(force=self.force)
 
             # When --force recreates the container, clear stale host-side log files.
@@ -2137,6 +2166,8 @@ class E2ETrialRunner:
                 self._clear_stale_log_files()
 
             self.orchestrator._update_task_queue_file(self.orchestrator.trial_root)
+            if getattr(self, "workflow", None):
+                self.workflow.initialize()
             logger.info("E2E environment ready, task queue populated")
 
             # Start watcher in background (only monitors for tags now)
@@ -2177,6 +2208,8 @@ class E2ETrialRunner:
         success = False
         try:
             if not resume_session:
+                if getattr(self, "workflow", None):
+                    self.workflow.invalidate_sessions()
                 # Force creation of new session by deleting persistent session ID
                 old_session_file = self.agent_output_dir / ".agent_session_id"
                 if old_session_file.exists():
@@ -2192,6 +2225,8 @@ class E2ETrialRunner:
 
             # Setup environment for resume (reuse container, restore state)
             logger.info("Setting up E2E environment for RESUME...")
+            if getattr(self, "workflow", None):
+                self.workflow.prepare()
             self.orchestrator.setup_environment_for_resume(
                 completed_milestones=trial_state.completed_milestones,
                 failed_milestones=trial_state.failed_milestones,
@@ -2201,6 +2236,8 @@ class E2ETrialRunner:
                 evaluated_hashes=trial_state.evaluated_hashes,
             )
             self.orchestrator._update_task_queue_file(self.orchestrator.trial_root)
+            if getattr(self, "workflow", None):
+                self.workflow.initialize()
             logger.info("E2E environment ready for resume, task queue updated")
 
             # Start watcher in background
@@ -2396,6 +2433,13 @@ def _run_resume_mode(args):
     agent_output_dir = trial_root / "log"
     agent_output_dir.mkdir(parents=True, exist_ok=True)
 
+    workflow = None
+    if metadata.get("workflow") or getattr(args, "workflow_config", None):
+        from workflows.integration import WorkflowIntegration
+        workflow = WorkflowIntegration.from_trial(
+            orchestrator, metadata.get("workflow"), getattr(args, "workflow_config", None),
+        )
+
     # Create trial runner
     trial = E2ETrialRunner(
         orchestrator=orchestrator,
@@ -2409,6 +2453,7 @@ def _run_resume_mode(args):
         copy_testbed=not args.skip_testbed_copy,
         remove_container=args.remove_container,
         reasoning_effort=metadata.get("reasoning_effort"),
+        workflow=workflow,
     )
 
     # Run with resume mode
@@ -2533,6 +2578,8 @@ Example:
         help="Claude Code CLI version to install: an exact version (for example 2.1.158), stable, or latest.",
     )
     parser.add_argument("--prompt-version", default="v2", help="Prompt template version (e.g., v1 or v2)")
+    parser.add_argument("--workflow-config", type=Path, default=None,
+                        help="Optional OpenSpec/ArtifactNet workflow YAML (Codex only; frozen per trial)")
     parser.add_argument(
         "--milestones",
         default=None,
@@ -2784,6 +2831,9 @@ Example:
     if trial_root.exists() and any(trial_root.iterdir()):
         if args.force:
             logger.warning(f"--force: wiping existing trial directory '{trial_root}'")
+            if (trial_root / "workflow" / "runtime.json").exists():
+                from workflows.runtime import discard_trial_runtime
+                discard_trial_runtime(trial_root)
             import shutil
             try:
                 shutil.rmtree(trial_root)
@@ -3000,6 +3050,9 @@ Example:
         "repo_config_binding": repo_config_binding.to_metadata(trial_root),
         "runtime_policy_binding": runtime_policy_binding.to_metadata(trial_root),
     }
+    if args.workflow_config:
+        from workflows.config import freeze
+        trial_metadata["workflow"] = freeze(args.workflow_config, trial_root, args.agent)
     metadata_path = trial_root / "trial_metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(trial_metadata, f, indent=2)
@@ -3033,6 +3086,11 @@ Example:
     agent_output_dir = trial_root / "log"
     agent_output_dir.mkdir(parents=True, exist_ok=True)
 
+    workflow = None
+    if trial_metadata.get("workflow"):
+        from workflows.integration import WorkflowIntegration
+        workflow = WorkflowIntegration.from_trial(orchestrator, trial_metadata["workflow"])
+
     # Create and run trial
     trial = E2ETrialRunner(
         orchestrator=orchestrator,
@@ -3047,6 +3105,7 @@ Example:
         remove_container=args.remove_container,
         reasoning_effort=args.reasoning_effort,
         force=args.force,
+        workflow=workflow,
     )
 
     success = trial.run()

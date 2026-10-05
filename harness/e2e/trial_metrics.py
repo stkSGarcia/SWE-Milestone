@@ -71,9 +71,12 @@ def trial_turns(agent_stats: Dict) -> Optional[int]:
 def trial_output_tokens(agent_stats: Dict) -> Optional[int]:
     """Total output tokens across all models in ``modelUsage``.
 
-    Sums ``outputTokens`` + ``thoughtsTokens`` (Gemini) + ``reasoningOutputTokens``
-    (Codex) + ``reasoningTokens`` (OpenHands) so reasoning-heavy models report
-    their full output work.
+    Sums ``outputTokens`` + ``thoughtsTokens`` (Gemini) + separate
+    ``reasoningOutputTokens`` + ``reasoningTokens`` (OpenHands) so reasoning-heavy
+    models report their full output work.
+
+    For Codex/OpenAI, ``reasoningOutputTokens`` is already included in
+    ``outputTokens`` and is not added again.
     """
     model_usage = agent_stats.get("modelUsage", {})
     if not model_usage:
@@ -85,7 +88,11 @@ def trial_output_tokens(agent_stats: Dict) -> Optional[int]:
         total += (
             m.get("outputTokens", 0)
             + m.get("thoughtsTokens", 0)
-            + m.get("reasoningOutputTokens", 0)
+            + (
+                0
+                if m.get("tokenAccounting") == "openai" or "cachedInputTokens" in m
+                else m.get("reasoningOutputTokens", 0)
+            )
             + m.get("reasoningTokens", 0)
         )
     return total if total > 0 else None
@@ -197,8 +204,10 @@ def load_e2e_trial_turns(workspace_root: Path, trial: str) -> Optional[int]:
 def load_e2e_trial_output_tokens(workspace_root: Path, trial: str) -> Optional[int]:
     """Load total output tokens from agent_stats.json or live agent_stdout.txt.
 
-    Sums outputTokens + thoughtsTokens (Gemini) + reasoningOutputTokens (Codex)
+    Sums outputTokens + thoughtsTokens (Gemini) + separate reasoningOutputTokens
     + reasoningTokens (OpenHands) across all models in modelUsage.
+    Codex/OpenAI outputTokens already includes reasoningOutputTokens, so that
+    detail is not added again.
     """
     stats = _load_e2e_stats(workspace_root, trial)
     if stats is None:

@@ -17,6 +17,7 @@ When both cache_write_5m and cache_write_1h are present, callers should use them
 for accurate Claude cost calculation. Otherwise, cache_write is the fallback.
 """
 
+import math
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -72,6 +73,28 @@ MODEL_PRICING: Dict[str, Dict[str, Any]] = {
     # GPT-5.6 (gpt-5.6-sol; developers.openai.com/api/docs/models/gpt-5.6-sol)
     # — same list pricing as gpt-5.5, flat across context.
     "gpt-5.6-sol": {"input": 5.00, "cache_read": 0.50, "output": 30.00},
+    # GPT-6.1-sol Standard pricing, verified 2026-10-20:
+    # https://developers.openai.com/api/docs/pricing
+    # Prompts above 272K use 2x input/cache and 1.5x output rates.
+    # Generic cache writes use the default 30-minute retention rate.
+    "gpt-6.1-sol": {
+        "tiers": [
+            {
+                "threshold": 272_000,
+                "input": 2.00,
+                "cache_read": 0.10,
+                "output": 10.00,
+                "cache_write": 2.50,
+            },
+            {
+                "threshold": float("inf"),
+                "input": 4.00,
+                "cache_read": 0.20,
+                "output": 15.00,
+                "cache_write": 5.00,
+            },
+        ],
+    },
     "gpt-5.3-codex": {"input": 1.75, "cache_read": 0.175, "output": 14.00},
     "gpt-5.2-codex": {"input": 1.75, "cache_read": 0.175, "output": 14.00},
     "gpt-5.2": {"input": 1.75, "cache_read": 0.175, "output": 14.00},
@@ -199,6 +222,7 @@ _MATCH_ORDER = [
     ("haiku", "claude-haiku"),
     ("sonnet", "claude-sonnet"),
     # GPT (substring → key, only where pattern differs from key or for short aliases)
+    ("gpt-6.1-sol", "gpt-6.1-sol"),  # provider prefixes and dated snapshots
     ("gpt-5.6-sol", "gpt-5.6-sol"),  # matches "gpt-5.6-sol-2026-xx-xx"
     ("gpt-5.5", "gpt-5.5"),  # matches "gpt-5.5-2026-04-23", "gpt-5.5-codex" etc.
     ("gpt-5.3-codex", "gpt-5.3-codex"),  # match "gpt-5.3-codex-xxxxx"
@@ -364,6 +388,10 @@ def calculate_cost_from_model_usage(model_usage: dict) -> Optional[float]:
     ``cacheCreationInputTokens``), OpenAI-style (``cachedInputTokens``), and
     Gemini-style (``cachedTokens``, ``thoughtsTokens``).
 
+    Codex entries with ``costSource`` preserve the sum of request-level costs
+    (or an explicitly marked aggregate estimate). Repricing their combined
+    token totals would lose the request lengths needed for tier selection.
+
     Returns None if model_usage is empty.
     """
     if not model_usage:
@@ -373,24 +401,39 @@ def calculate_cost_from_model_usage(model_usage: dict) -> Optional[float]:
     for model_id, usage in model_usage.items():
         if not isinstance(usage, dict):
             continue
+        if usage.get("costSource") in {"request_usage", "aggregate_estimate", "mixed"}:
+            cost = usage.get("costUSD")
+            if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
+                total += cost
+                continue
+        # OpenAI input includes cached tokens; reasoning is a subset of output.
+        # Claude/Gemini use separate counters, so retain their existing rules.
+        openai_usage = usage.get("tokenAccounting") == "openai" or "cachedInputTokens" in usage
+        cache_read = (
+            usage.get("cacheReadInputTokens", 0)
+            or usage.get("cachedInputTokens", 0)
+            or usage.get("cachedTokens", 0)  # Gemini parser field
+        )
+        cache_write = usage.get("cacheCreationInputTokens", 0)
+        input_tokens = usage.get("inputTokens", 0)
+        if openai_usage:
+            input_tokens = max(0, input_tokens - cache_read - cache_write)
         total += calculate_cost(
             model=model_id,
-            input_tokens=usage.get("inputTokens", 0),
+            input_tokens=input_tokens,
             # Reasoning ("thoughts") output is billed at the output rate by
             # Gemini, and Codex/OpenHands report reasoning output separately.
             # Fold them in so the recomputed per-milestone cost matches the
             # parser's own _calculate_cost (mirrors load_e2e_trial_output_tokens).
+            # Codex's reasoning detail is already included in outputTokens;
+            # add only counters that represent additional output.
             output_tokens=(
                 usage.get("outputTokens", 0)
                 + usage.get("thoughtsTokens", 0)
-                + usage.get("reasoningOutputTokens", 0)
+                + (0 if openai_usage else usage.get("reasoningOutputTokens", 0))
                 + usage.get("reasoningTokens", 0)
             ),
-            cache_read_tokens=(
-                usage.get("cacheReadInputTokens", 0)
-                or usage.get("cachedInputTokens", 0)
-                or usage.get("cachedTokens", 0)  # Gemini parser field
-            ),
-            cache_write_tokens=usage.get("cacheCreationInputTokens", 0),
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
         )
     return total

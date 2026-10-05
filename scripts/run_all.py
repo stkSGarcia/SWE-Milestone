@@ -220,6 +220,7 @@ def build_cmd(
     build_failure_fail_closed: bool = False,
     runtime_policy: ResolvedRuntimePolicy | None = None,
     skip_testbed_copy: bool = False,
+    workflow_config: Path | None = None,
 ) -> tuple[list[str], str]:
     """Build the run_e2e command for one repo. Returns (cmd, mode_label)."""
     repo_name = repo.name
@@ -229,10 +230,10 @@ def build_cmd(
         # Resume reuses the existing trial dir, where --milestones already wrote
         # milestone_selection.txt on first run (the orchestrator still reads it),
         # so the prefix is preserved without re-passing --milestones here.
-        return (
-            [sys.executable, "-m", "harness.e2e.run_e2e", "--resume-trial", str(trial_dir)],
-            "resume",
-        )
+        resume_cmd = [sys.executable, "-m", "harness.e2e.run_e2e", "--resume-trial", str(trial_dir)]
+        if workflow_config:
+            resume_cmd.extend(["--workflow-config", str(workflow_config)])
+        return resume_cmd, "resume"
 
     # Compatibility for direct callers of build_cmd.  The normal main() path
     # always supplies its one pre-resolved object, which is then used for the
@@ -276,6 +277,8 @@ def build_cmd(
         cmd.append("--force")
     if skip_testbed_copy:
         cmd.append("--skip-testbed-copy")
+    if workflow_config:
+        cmd.extend(["--workflow-config", str(workflow_config)])
     return cmd, ("force" if force else "fresh")
 
 
@@ -347,6 +350,16 @@ def main():
 
     yaml_trial_name = cfg["trial_name"]
     agent = cfg.get("agent", "claude-code")
+    workflow_config = None
+    if cfg.get("workflow_config"):
+        from workflows.config import load
+        workflow_config = Path(os.path.expandvars(str(cfg["workflow_config"]))).expanduser()
+        if not workflow_config.is_absolute():
+            workflow_config = args.config.resolve().parent / workflow_config
+        workflow_config = workflow_config.resolve()
+        load(workflow_config)
+        if agent != "codex":
+            raise ValueError("workflow_config currently requires agent: codex")
     model = cfg.get("model", "claude-sonnet-4-5-20250929")
     timeout = cfg.get("timeout", 18000)
     reasoning_effort = cfg.get("reasoning_effort", None)
@@ -653,6 +666,7 @@ def main():
             milestones, project_root, build_failure_fail_closed,
             runtime_policy=runtime_policy,
             skip_testbed_copy=args.skip_testbed_copy,
+            workflow_config=workflow_config,
         )
         # Fresh workers inherit env derived from the SAME resolved object that
         # selected their image. Resume workers inherit no live managed state and

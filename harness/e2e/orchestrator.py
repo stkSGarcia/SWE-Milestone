@@ -780,6 +780,9 @@ class E2EOrchestrator:
         # mapping to its (possibly new) IP do not. Re-ensure it here (idempotent)
         # so the endpoint resolves through a live sidecar before verify probes it.
         self.container_setup._ensure_sni_sidecar()
+        extension = getattr(self.container_setup, "runtime_extension", None)
+        if extension:
+            extension.allow_services()
 
         # Verify network lockdown is still active (iptables persists across stop/start)
         try:
@@ -1639,6 +1642,10 @@ class E2EOrchestrator:
             moved = SubmissionTagMoved(agent_tag, agent_commit, current or "", "before-capture")
             self._record_submission_discard(mid, moved)
             raise moved
+
+        submission_guard = getattr(self, "submission_guard", None)
+        if submission_guard:
+            submission_guard(mid, agent_commit)
 
         # Mark as submitted immediately and update task queue
         # This removes the task from agent's view right away (silent mode)

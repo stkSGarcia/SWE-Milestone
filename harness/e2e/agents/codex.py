@@ -330,6 +330,7 @@ except Exception as e:
 
 # === Codex: Setup OAuth credentials ===
 try:
+    import json
     import os
     import pwd
     import shutil
@@ -361,14 +362,16 @@ try:
     # letting the agent fetch upstream code from github/etc even when the
     # repo's own network path is blocked. Kept strictly off for benchmark
     # integrity (valid values: disabled, cached, live).
-    config_lines = [
-        'web_search = "disabled"',
+    config_lines = ['web_search = "disabled"']
+    if base_url:
+        config_lines.append(f'openai_base_url = {json.dumps(base_url, ensure_ascii=False)}')
+    # TOML keys following a table header belong to that table. Write all
+    # root settings before [features], whose values must be booleans.
+    config_lines.extend([
         '',
         '[features]',
         *[f'{feature} = false' for feature in __CODEX_DISABLED_FEATURES__],
-    ]
-    if base_url:
-        config_lines.append(f'openai_base_url = "{base_url}"')
+    ])
     with open(config_dst, 'w') as f:
         f.write('\\n'.join(config_lines) + '\\n')
     os.chown(config_dst, uid, gid)
